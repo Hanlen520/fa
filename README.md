@@ -1,22 +1,29 @@
 # fa = fast adb
 [![Build Status](https://travis-ci.org/codeskyblue/fa.svg?branch=master)](https://travis-ci.org/codeskyblue/fa)
+[![GoDoc](https://godoc.org/github.com/codeskyblue/fa/adb?status.svg)](https://godoc.org/github.com/codeskyblue/fa/adb)
 
 `fa` is a command line tool that wraps `adb` in order to extend it with extra features and commands that make working with Android easier.
+
+This project is still in developing, please be careful when use in production.
 
 ## Features
 - [x] show device selection when multi device connected
 - [x] screenshot
 - [x] install support http url
 - [x] support launch after install apk
+- [x] support `fa devices --json`
+- [x] support `fa shell`
+- [x] colorful logcat and filter with package name
 - [ ] install apk and auto click confirm
-- [.] check device health status
+- [ ] check device health status
 - [ ] show current app
 - [ ] unlock device
 - [ ] reset device state, clean up installed packages
-- [ ] support `fa devices --json`
 - [ ] show wlan (ip,mac,signal), enable and disable it
-- [ ] share device to public web
+- [x] share device to public web
+- [ ] fa share-server
 - [ ] install ipa support
+- [x] fahub service
 
 ## Install
 **For mac**
@@ -35,6 +42,20 @@ download binary from [**releases**](https://github.com/codeskyblue/fa/releases)
 ```bash
 $ fa version
 fa version v0.0.5 # just example
+adb server version 28
+```
+
+### Show devices
+- [x] Remove header `List of devices attached` to make it easy parse
+
+```bash
+$ fa devices
+3578298f        device
+
+$ fa devices --json
+[
+   {"serial": "3578298f", "status": "device"}
+]
 ```
 
 ### Run adb command with device select
@@ -59,7 +80,7 @@ $ ANDROID_SERIAL=3578298 fa adb shell pwd
 ```
 
 ### Screenshot
-only `png` format
+only `png` format now.
 
 ```bash
 fa screenshot -o screenshot.png
@@ -90,15 +111,106 @@ Launch io.appium.android.apis ...
 + adb -s 0123456789ABCDEF shell am start -n io.appium.android.apis/.ApiDemos
 ```
 
+### App
+```
+$ fa app list # show all app package names
+$ fa app list -3 # only show third party packages
+```
 
+### Shell
+Like `adb shell`, run `fa shell` will open a terminal
 
-## Reference
-Articles
+The difference is `fa shell` will add `/data/local/tmp` into `$PATH`
+So if you have binary `busybox` in `/data/local/tmp`,
+You can just run
 
+```
+$ fa shell busybox ls
+# using adb shell you have to
+$ adb shell /data/local/tmp/busybox ls
+```
+
+### Watch
+Trace device `came online` and `went offline`
+
+```bash
+$ fa watch
+3578298f offline
+3578298f device
+```
+
+Hook script when device online
+
+```bash
+# on windows
+$ fa watch --online-hook-cmd="echo %SERIAL%" 
+
+# on linux
+$ fa watch --online-hook-cmd="echo \$SERIAL" 
+```
+
+This subcommand seems not very stable, raise issue when you find something wrong.
+
+### Share
+Share local device
+
+```bash
+# share in localnet
+$ fa share
+Connect with: adb connect 10.0.0.1:6174
+
+# share to public ip
+$ fa share --tunnel
+______                   __
+/_  __/_ _____  ___  ___ / /
+ / / / // / _ \/ _ \/ -_) /
+/_/  \_,_/_//_/_//_/\__/_/ v0.2.11
+
+Expose local servers to internet securely
+https://labstack.com/docs/tunnel
+________________________________O/_______
+                                O\
+⇨ routing traffic from tcp://leo.labstack.me:10081
+```
+
+When use tunnel, you should use `adb connect leo.labstack.me:10081`
+
+Then you can use adb to do anything just like device plugged in your computer.
+
+### Pidcat (logcat)
+Current implementation is wrapper of [pidcat.py](https://github.com/JakeWharton/pidcat)
+So use this feature, you need python installed.
+
+```bash
+$ fa help pidcat
+USAGE:
+   fa pidcat [package-name ...]
+
+OPTIONS:
+   --current                     filter logcat by current running app
+   --clear                       clear the entire log before running
+   --min-level value, -l value   Minimum level to be displayed {V,D,I,W,E,F}
+   --tag value, -t value         filter output by specified tag(s)
+   --ignore-tag value, -i value  filter output by ignoring specified tag(s)
+```
+
+The pidcat is very beautiful.
+
+![pidcat](https://github.com/JakeWharton/pidcat/raw/master/screen.png)
+
+## Thanks for these Articles and Codes
+- <https://labstack.com/docs/tunnel>
 - <https://github.com/mzlogin/awesome-adb>
 - [Facebook One World Project](https://code.fb.com/android/managing-resources-for-large-scale-testing/)
 - [Facebook Device Lab](https://code.fb.com/android/the-mobile-device-lab-at-the-prineville-data-center/)
 - Article reverse ssh tunnling <https://www.howtoforge.com/reverse-ssh-tunneling>
+- [openstf/adbkit](https://github.com/openstf/adbkit)
+- [ADB Source Code](https://github.com/aosp-mirror/platform_system_core/blob/master/adb)
+- ADB Protocols [OVERVIEW.TXT](https://github.com/aosp-mirror/platform_system_core/blob/master/adb/OVERVIEW.TXT) [SERVICES.TXT](https://github.com/aosp-mirror/platform_system_core/blob/master/adb/SERVICES.TXT) [SYNC.TXT](https://github.com/aosp-mirror/platform_system_core/blob/master/adb/SYNC.TXT)
+- [JakeWharton/pidcat](https://github.com/JakeWharton/pidcat)
+- <https://github.com/wmbest2/android>
+- <https://github.com/zach-klippenstein/goadb>
+
 
 Libs might be useful
 
@@ -107,6 +219,8 @@ Libs might be useful
 - <https://github.com/koding/tunnel>
 - <https://github.com/mmatczuk/go-http-tunnel>
 - <https://github.com/inconshreveable/go-tunnel>
+- <https://github.com/labstack/tunnel-client> SSH Tunnel
+- <https://github.com/gliderlabs/ssh> Easy SSH servers in Golang
 
 ## LICENSE
 [MIT](LICENSE)

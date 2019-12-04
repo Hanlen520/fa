@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	shellquote "github.com/kballard/go-shellquote"
 )
 
 const (
@@ -65,11 +67,13 @@ type AdbConnection struct {
 	net.Conn
 }
 
-// SendPacket data is like "000chost:version"
-func (conn *AdbConnection) SendPacket(data string) error {
+func (conn *AdbConnection) WritePacket(data string) error {
 	pktData := fmt.Sprintf("%04x%s", len(data), data)
 	_, err := conn.Write([]byte(pktData))
-	return err
+	if err != nil {
+		return err
+	}
+	return conn.respCheck()
 }
 
 func (conn *AdbConnection) readN(n int) (v string, err error) {
@@ -79,6 +83,26 @@ func (conn *AdbConnection) readN(n int) (v string, err error) {
 		return
 	}
 	return string(buf), nil
+}
+
+// respCheck check OKAY, or FAIL
+func (conn *AdbConnection) respCheck() error {
+	status, err := conn.readN(4)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case _OKAY:
+		return nil
+	case _FAIL:
+		data, err := conn.readString()
+		if err != nil {
+			return err
+		}
+		return errors.New(data)
+	default:
+		return fmt.Errorf("Unexpected response: %s, should be OKAY or FAIL", strconv.Quote(status))
+	}
 }
 
 func (conn *AdbConnection) readString() (string, error) {
@@ -94,66 +118,52 @@ func (conn *AdbConnection) readString() (string, error) {
 	return conn.readN(length)
 }
 
-// RecvPacket receive data like "OKAY00040028"
-func (conn *AdbConnection) RecvPacket() (data string, err error) {
-	stat, err := conn.readN(4)
+type AdbDevice struct {
+	*AdbClient
+	Serial string
+}
+
+func (c *AdbDevice) OpenShell(cmd string) (rw io.ReadWriteCloser, err error) {
+	conn, err := c.newConnection()
 	if err != nil {
-		return "", err
-	}
-	switch stat {
-	case _OKAY:
-		return conn.readString()
-	case _FAIL:
-		data, err = conn.readString()
-		if err != nil {
-			return
-		}
-		err = errors.New(data)
 		return
-	default:
-		return "", fmt.Errorf("Unknown stat: %s", strconv.Quote(stat))
 	}
-}
-
-type AdbClient struct {
-	Addr string
-}
-
-func NewAdbClient() *AdbClient {
-	return &AdbClient{
-		Addr: "127.0.0.1:5037",
-	}
-}
-
-var DefaultAdbClient = &AdbClient{
-	Addr: "127.0.0.1:5037",
-}
-
-func (c *AdbClient) newConnection() (conn *AdbConnection, err error) {
-	netConn, err := net.Dial("tcp", c.Addr)
+	err = conn.WritePacket("host:transport:" + c.Serial)
 	if err != nil {
-		return nil, err
+		return
 	}
-	return &AdbConnection{netConn}, nil
+	err = conn.WritePacket("shell:" + cmd) //shellquote.Join(args...)) // + " ; echo :$?")
+	if err != nil {
+		return
+	}
+	return conn, nil
 }
 
-func (c *AdbClient) Version() (string, error) {
-	ver, err := c.rawVersion()
-	if err == nil {
-		return ver, nil
-	}
-	exec.Command(adbPath(), "start-server").Run()
-	return c.rawVersion()
+// OpenCommand accept list of args return combined output reader
+func (c *AdbDevice) OpenCommand(args ...string) (reader io.ReadWriteCloser, err error) {
+	return c.OpenShell(shellquote.Join(args...))
 }
 
-// Version returns adb server version
-func (c *AdbClient) rawVersion() (string, error) {
+func (c *AdbDevice) RunCommand(args ...string) (exitCode int, err error) {
+	// TODO
+	reader, err := c.OpenCommand(args...)
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+	_, err = io.Copy(os.Stdout, reader)
+	return
+}
+
+func (c *AdbDevice) SerialNo() (string, error) {
 	conn, err := c.newConnection()
 	if err != nil {
 		return "", err
 	}
-	if err := conn.SendPacket("host:version"); err != nil {
+
+	err = conn.WritePacket("host-serial:" + c.Serial + ":get-serialno")
+	if err != nil {
 		return "", err
 	}
-	return conn.RecvPacket()
+	return conn.readString()
 }

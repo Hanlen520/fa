@@ -1,16 +1,29 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
+	"math/rand"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	shellquote "github.com/kballard/go-shellquote"
+	tty "github.com/mattn/go-tty"
+
+	"github.com/codeskyblue/fa/adb"
+	"github.com/codeskyblue/fa/tunnel"
 	"github.com/manifoldco/promptui"
 	cli "gopkg.in/urfave/cli.v1"
 )
@@ -19,11 +32,14 @@ var (
 	version       = "develop"
 	debug         = false
 	defaultSerial string
+	defaultHost   string
+	defaultPort   int
 )
 
 type Device struct {
-	Serial      string
-	Description string
+	Serial      string `json:"serial"`
+	Status      string `json:"status"`
+	Description string `json:"-"`
 }
 
 func (d *Device) String() string {
@@ -47,6 +63,24 @@ func shortDeviceInfo(s string) string {
 }
 
 func listDevices() (ds []Device, err error) {
+	output, err := exec.Command("adb", "devices").CombinedOutput()
+	if err != nil {
+		return
+	}
+	re := regexp.MustCompile(`(?m)^([^\s]+)\s+(device|offline|unauthorized)\s*$`)
+	matches := re.FindAllStringSubmatch(string(output), -1)
+	ds = make([]Device, 0, len(matches))
+	for _, m := range matches {
+		status := m[2]
+		ds = append(ds, Device{
+			Serial: m[1],
+			Status: status,
+		})
+	}
+	return
+}
+
+func listDetailedDevices() (ds []Device, err error) {
 	output, err := exec.Command("adb", "devices", "-l").CombinedOutput()
 	if err != nil {
 		return
@@ -89,7 +123,7 @@ func choose(devices []Device) Device {
 }
 
 func chooseOne() (serial string, err error) {
-	devices, err := listDevices()
+	devices, err := listDetailedDevices()
 	if err != nil {
 		return
 	}
@@ -156,20 +190,41 @@ func main() {
 			EnvVar:      "ANDROID_SERIAL",
 			Destination: &defaultSerial,
 		},
+		cli.StringFlag{
+			Name:        "host, H",
+			Usage:       "name of adb server host",
+			Value:       "localhost",
+			Destination: &defaultHost,
+		},
+		cli.IntFlag{
+			Name:        "port, P",
+			Usage:       "port of adb server",
+			Value:       5037,
+			Destination: &defaultPort,
+		},
 	}
 	app.Commands = []cli.Command{
+		{
+			Name:            "adb",
+			Usage:           "exec adb with device select",
+			SkipFlagParsing: true,
+			Action: func(ctx *cli.Context) error {
+				adbWrap(ctx.Args()...)
+				return nil
+			},
+		},
 		{
 			Name:  "version",
 			Usage: "show version",
 			Action: func(ctx *cli.Context) error {
-				fmt.Printf("fa  version %s\n", version)
-				adbVersion, err := DefaultAdbClient.Version()
+				fmt.Printf("fa version %s\n", version)
+				adbVersion, err := NewAdbClient().Version()
 				if err != nil {
 					fmt.Printf("adb version err: %v\n", err)
 					return err
 				}
-				fmt.Println("adb version", adbVersion)
 				fmt.Println("adb path", adbPath())
+				fmt.Println("adb server version", adbVersion)
 				return nil
 				// output, err := exec.Command(adbPath(), "version").Output()
 				// for _, line := range strings.Split(string(output), "\n") {
@@ -179,12 +234,66 @@ func main() {
 			},
 		},
 		{
-			Name:            "adb",
-			Usage:           "exec adb with device select",
-			SkipFlagParsing: true,
+			Name:  "devices",
+			Usage: "show connected devices",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "json",
+					Usage: "output json format",
+				},
+			},
 			Action: func(ctx *cli.Context) error {
-				adbWrap(ctx.Args()...)
+				ds, err := listDevices()
+				if err != nil {
+					return err
+				}
+				if ctx.Bool("json") {
+					data, _ := json.MarshalIndent(ds, "", "  ")
+					fmt.Println(string(data))
+				} else {
+					for _, d := range ds {
+						fmt.Printf("%s\t%s\n", d.Serial, d.Status)
+					}
+				}
 				return nil
+			},
+		},
+		{
+			Name:  "app",
+			Usage: "app view and managerment",
+			Subcommands: []cli.Command{
+				{
+					Name:  "list",
+					Usage: "list app",
+					Flags: []cli.Flag{
+						cli.BoolFlag{
+							Name:  "f",
+							Usage: "see their associated file",
+						},
+						cli.BoolFlag{
+							Name:  "s",
+							Usage: "filter to only show system packages",
+						},
+						cli.BoolFlag{
+							Name:  "3",
+							Usage: "filter to only show third party packages",
+						},
+					},
+					Action: func(ctx *cli.Context) error {
+						args := []string{"shell", "pm", "list", "packages"}
+						if ctx.Bool("s") {
+							args = append(args, "-s")
+						}
+						if ctx.Bool("f") {
+							args = append(args, "-f")
+						}
+						if ctx.Bool("3") {
+							args = append(args, "-3")
+						}
+						adbWrap(args...)
+						return nil
+					},
+				},
 			},
 		},
 		{
@@ -204,10 +313,40 @@ func main() {
 			Action: actScreenshot,
 		},
 		{
+			Name:            "shell",
+			Usage:           "run shell command",
+			SkipFlagParsing: true,
+			Action: func(ctx *cli.Context) error {
+				serial, err := chooseOne()
+				if err != nil {
+					return err
+				}
+				device := DefaultAdbClient.DeviceWithSerial(serial)
+
+				var cmd string
+				if len(ctx.Args()) != 0 {
+					cmd = `PATH="$PATH:/data/local/tmp" ` + shellquote.Join(ctx.Args()...)
+				}
+				rwc, err := device.OpenShell(cmd)
+				if err != nil {
+					return err
+				}
+				defer rwc.Close()
+				tty, err := tty.Open()
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer tty.Close()
+				go io.Copy(rwc, tty.Input())
+				_, err = io.Copy(tty.Output(), rwc)
+				return err
+			},
+		},
+		{
 			Name:      "install",
 			Usage:     "install apk",
 			UsageText: "fa install [ul] <apk-file | url>",
-			// UseShortOptionHandling: true,
+			// UseShortOptionHandling: true, // not supported in current urfav/cli
 			Flags: []cli.Flag{
 				cli.BoolFlag{
 					Name:  "force, f",
@@ -221,6 +360,84 @@ func main() {
 			Action: actInstall,
 		},
 		{
+			Name:      "pidcat",
+			Usage:     "logcat filter with package name",
+			UsageText: "fa pidcat [package-name ...]",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "current",
+					Usage: "filter logcat by current running app",
+				},
+				cli.BoolFlag{
+					Name:  "clear",
+					Usage: "clear the entire log before running",
+				},
+				cli.StringFlag{
+					Name:  "min-level, l",
+					Usage: "Minimum level to be displayed {V,D,I,W,E,F}",
+				},
+				cli.StringSliceFlag{
+					Name:  "tag, t",
+					Usage: "filter output by specified tag(s)",
+				},
+				cli.StringSliceFlag{
+					Name:  "ignore-tag, i",
+					Usage: "filter output by ignoring specified tag(s)",
+				},
+			},
+			Action: func(ctx *cli.Context) error {
+				serial, err := chooseOne()
+				if err != nil {
+					return err
+				}
+				faDir := filepath.Join(os.Getenv("HOME"), ".fa")
+				if err := os.MkdirAll(faDir, 0755); err != nil {
+					return err
+				}
+				pidcatPath := filepath.Join(faDir, "pidcat.py")
+				err = ioutil.WriteFile(pidcatPath, []byte(pidcatCode), 0644)
+				if err != nil {
+					return err
+				}
+				args := []string{pidcatPath, "-s", serial}
+				if ctx.Bool("current") {
+					args = append(args, "--current")
+				}
+				if ctx.Bool("clear") {
+					args = append(args, "--clear")
+				}
+				if ctx.String("min-level") != "" {
+					args = append(args, "-l", ctx.String("min-level"))
+				}
+				for _, tag := range ctx.StringSlice("tag") {
+					args = append(args, "-t", tag)
+				}
+				for _, ignore := range ctx.StringSlice("ignore-tag") {
+					args = append(args, "-i", ignore)
+				}
+				args = append(args, ctx.Args()...)
+				return runCommand("python", args...)
+			},
+		},
+		{
+			Name:  "get-serialno",
+			Usage: "print serial-number",
+			Action: func(ctx *cli.Context) error {
+				serial, err := chooseOne()
+				if err != nil {
+					return err
+				}
+				client := NewAdbClient()
+				device := client.DeviceWithSerial(serial)
+				realSerial, err := device.SerialNo()
+				if err != nil {
+					return err
+				}
+				println(realSerial)
+				return nil
+			},
+		},
+		{
 			Name:  "healthcheck",
 			Usage: "check device health status",
 			Action: func(ctx *cli.Context) error {
@@ -230,6 +447,96 @@ func main() {
 					return err
 				}
 				log.Println("OKAY")
+				return nil
+			},
+		},
+		{
+			Name:  "share",
+			Usage: "provides an USB device over TCP using a translating proxy",
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "tunnel",
+					Usage: "share device to public net, using labstack.me tunnel service",
+				},
+				cli.IntFlag{
+					Name:  "port",
+					Usage: "listen port",
+					Value: 6174,
+				},
+			},
+			Action: func(ctx *cli.Context) error {
+				serial, err := chooseOne()
+				if err != nil {
+					return err
+				}
+				client := adb.NewClient(fmt.Sprintf("%s:%d", defaultHost, defaultPort))
+				device := client.DeviceWithSerial(serial)
+
+				if !ctx.Bool("tunnel") {
+					adbd := adb.NewADBDaemon(device)
+					fmt.Printf("Connect with: adb connect %s:%d\n", GetLocalIP(), ctx.Int("port"))
+					return adbd.ListenAndServe(":" + strconv.Itoa(ctx.Int("port")))
+				}
+
+				rand.Seed(time.Now().Unix())
+				c := &tunnel.Configuration{
+					Host:       "labstack.me:22",
+					RemoteHost: "0.0.0.0",
+					RemotePort: 10000 + rand.Intn(2000),
+					Channel:    make(chan int),
+					InBoundConnectionHook: func(in net.Conn) error {
+						log.Println("Accept new connection", in.RemoteAddr().String())
+						device.ServeTCP(in)
+						return nil
+					},
+				}
+
+			CREATE:
+				go tunnel.Create(c)
+				event := <-c.Channel
+				if event == tunnel.EventReconnect {
+					log.Println("trying to reconnect")
+					time.Sleep(1 * time.Second)
+					goto CREATE
+				}
+				return nil
+			},
+		},
+		{
+			Name:  "watch",
+			Usage: "show newest state when device state change",
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:  "online-hook-cmd",
+					Usage: "run when device came online",
+				},
+			},
+			Action: func(ctx *cli.Context) error {
+				client := NewAdbClient()
+				eventC, err := client.Watch()
+				if err != nil {
+					return err
+				}
+				onlineHook := ctx.String("online-hook-cmd")
+				for ev := range eventC {
+					fmt.Println(ev)
+					if ev.CameOnline() {
+						// log.Println("Online", ev)
+						var cmd *exec.Cmd
+						if runtime.GOOS == "windows" {
+							cmd = exec.Command("cmd", "/c", onlineHook)
+						} else {
+							cmd = exec.Command("bash", "-c", onlineHook)
+						}
+						cmd.Env = append(os.Environ(), "SERIAL="+ev.Serial)
+						cmd.Stdout = os.Stdout
+						cmd.Stderr = os.Stderr
+						cmd.Run()
+					}
+					// if ev.WentOffline {
+
+					// }
+				}
 				return nil
 			},
 		},
